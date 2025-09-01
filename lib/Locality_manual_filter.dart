@@ -3,6 +3,9 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart'; 
 import 'firebase_options.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:geolocator/geolocator.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -42,6 +45,46 @@ class _FilterBarState extends State<FilterBar> {
   }
 }
 
+// 🔹 Convert address → lat/lng using OpenStreetMap Nominatim
+Future<List<Map<String, dynamic>>> searchAddress(String query) async {
+  if (query.isEmpty) return [];
+
+  final url = Uri.parse(
+      "https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(query)}&format=json&limit=5");
+
+  final response = await http.get(url, headers: {
+    "User-Agent": "DoctorApp/1.0 (your_email@example.com)"
+  });
+
+  if (response.statusCode == 200) {
+    final data = json.decode(response.body);
+    return List<Map<String, dynamic>>.from(data);
+  }
+  return [];
+}
+
+
+// 🔹 Add this function just below
+Future<Map<String, double>?> getLatLngFromAddress(String address) async {
+  final url = Uri.parse(
+      "https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(address)}&format=json&limit=1");
+
+  final response = await http.get(url, headers: {
+    "User-Agent": "DoctorApp/1.0 (your_email@example.com)"
+  });
+
+  if (response.statusCode == 200) {
+    final data = json.decode(response.body);
+    if (data.isNotEmpty) {
+      return {
+        "lat": double.parse(data[0]["lat"]),
+        "lng": double.parse(data[0]["lon"]),
+      };
+    }
+  }
+  return null;
+}
+
 
 class ClinicListPage extends StatefulWidget {
   final bool isLoggedIn;
@@ -66,10 +109,58 @@ class _ClinicListPageState extends State<ClinicListPage> {
   String selectedArea = "All";
   List<String> availableAreas = ["All"];
 
+  Position? currentPosition;
+  String? currentAddress;
+
   @override
   void initState() {
     super.initState();
-    fetchClinicsFromFirestore();
+    _getCurrentLocation();
+  }
+
+  Future<void> _getCurrentLocation() async {
+  bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+  if (!serviceEnabled) return;
+
+  LocationPermission permission = await Geolocator.requestPermission();
+  if (permission == LocationPermission.denied ||
+      permission == LocationPermission.deniedForever) return;
+
+  Position position = await Geolocator.getCurrentPosition(
+      desiredAccuracy: LocationAccuracy.high);
+
+  setState(() {
+    currentPosition = position;
+  });
+
+  // 🔹 Fetch human-readable address
+  final address = await getAddressFromLatLng(
+      position.latitude, position.longitude);
+
+  setState(() {
+    currentAddress = address;
+  });
+
+  fetchClinicsFromFirestore();
+}
+
+
+  double calculateDistance(double lat, double lng) {
+    if (currentPosition == null) return double.infinity;
+    return Geolocator.distanceBetween(
+      currentPosition!.latitude,
+      currentPosition!.longitude,
+      lat,
+      lng,
+    );
+  }
+
+  String formatDistance(double meters) {
+    if (meters >= 1000) {
+      return "${(meters / 1000).toStringAsFixed(1)} km away";
+    } else {
+      return "${meters.toStringAsFixed(0)} m away";
+    }
   }
 
   Future<void> fetchClinicsFromFirestore() async {
@@ -77,31 +168,40 @@ class _ClinicListPageState extends State<ClinicListPage> {
         await FirebaseFirestore.instance.collection('clinics').get();
 
     final loadedClinics = querySnapshot.docs.map((doc) {
-  final data = doc.data();
-  return {
-    'id': doc.id,
-    'name': data['name'] ?? '',
-    'email': data['email'] ?? '',
-    'phone': data['phone'] ?? '',
-    'address': data['address'] ?? '',
-    'area': data['area'] ?? '',             // 👈 Added
-    'townCity': data['townCity'] ?? '',
-    'state': data['state'] ?? '',
-    'medicalId': data['medicalId'] ?? '',
-    'council': data['council'] ?? '',
-    'experience': data['experience'] ?? '',
-    'qualification': data['qualification'] ?? '',
-    'timing': data['timing'] ?? '',
-  };
-}).toList();
+      final data = doc.data();
+      return {
+        'id': doc.id,
+        'name': data['name'] ?? '',
+        'email': data['email'] ?? '',
+        'phone': data['phone'] ?? '',
+        'address': data['address'] ?? '',
+        'area': data['area'] ?? '',
+        'townCity': data['townCity'] ?? '',
+        'state': data['state'] ?? '',
+        'medicalId': data['medicalId'] ?? '',
+        'council': data['council'] ?? '',
+        'experience': data['experience'] ?? '',
+        'qualification': data['qualification'] ?? '',
+        'timing': data['timing'] ?? '',
+        'lat': (data['lat'] ?? 0.0).toDouble(),
+        'lng': (data['lng'] ?? 0.0).toDouble(),
+      };
+    }).toList();
 
-final areas = <String>{"All"};
-for (var clinic in loadedClinics) {
-  if (clinic['area'].toString().isNotEmpty) {
-    areas.add(clinic['area']);   // 👈 Use area here
-  }
-}
+    final areas = <String>{"All"};
+    for (var clinic in loadedClinics) {
+      if (clinic['area'].toString().isNotEmpty) {
+        areas.add(clinic['area']);
+      }
+    }
 
+    if (currentPosition != null) {
+      loadedClinics.sort((a, b) {
+        final distA = calculateDistance(a['lat'], a['lng']);
+        final distB = calculateDistance(b['lat'], b['lng']);
+        return distA.compareTo(distB);
+      });
+    }
 
     setState(() {
       clinicList = loadedClinics;
@@ -111,19 +211,18 @@ for (var clinic in loadedClinics) {
   }
 
   void filterClinics(String query) {
-  final results = clinicList.where((clinic) {
-    final matchesName =
-        clinic['name'].toLowerCase().contains(query.toLowerCase());
-    final matchesArea = (selectedArea == "All" ||
-        clinic['area'].toLowerCase().contains(selectedArea.toLowerCase())); // 👈 Changed
-    return matchesName && matchesArea;
-  }).toList();
+    final results = clinicList.where((clinic) {
+      final matchesName =
+          clinic['name'].toLowerCase().contains(query.toLowerCase());
+      final matchesArea = (selectedArea == "All" ||
+          clinic['area'].toLowerCase().contains(selectedArea.toLowerCase())); 
+      return matchesName && matchesArea;
+    }).toList();
 
-  setState(() {
-    filteredList = results;
-  });
-}
-
+    setState(() {
+      filteredList = results;
+    });
+  }
 
   void filterByArea(String area) {
     setState(() {
@@ -143,19 +242,56 @@ for (var clinic in loadedClinics) {
     }
   }
 
+  // 🔹 Step 1: Beautiful card UI
+  Widget buildClinicCard(Map<String, dynamic> clinic) {
+    final distance = calculateDistance(clinic['lat'], clinic['lng']);
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+      margin: EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+      child: ListTile(
+        contentPadding: EdgeInsets.all(16),
+        title: Text(
+          clinic['name'] ?? 'Unnamed Clinic',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(height: 4),
+            Text("Qualification: ${clinic['qualification']}"),
+            Text("Phone: ${clinic['phone']}"),
+            Text("Address: ${clinic['address']}"),
+            Text("Timing: ${clinic['timing']}"),
+            if (currentPosition != null)
+              Text(
+                formatDistance(distance),
+                style: TextStyle(color: Colors.blueGrey),
+              ),
+          ],
+        ),
+        trailing: Icon(Icons.local_hospital, color: Colors.blue),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      // 🔹 Step 2: Gradient AppBar
       appBar: AppBar(
-        title: Text("Doctor App"),
-        backgroundColor: const Color.fromARGB(255, 106, 179, 239),
+        title: Text("Doctor App", style: TextStyle(fontWeight: FontWeight.bold)),
+        flexibleSpace: Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [Colors.blue, Colors.lightBlueAccent],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+          ),
+        ),
         actions: [
           if (widget.isLoggedIn) ...[
-            IconButton(
-              icon: Icon(Icons.add),
-              onPressed: navigateToAddClinic,
-              tooltip: 'Add Clinic',
-            ),
             IconButton(
               icon: Icon(Icons.logout),
               onPressed: widget.onLogout,
@@ -184,6 +320,16 @@ for (var clinic in loadedClinics) {
             ),
         ],
       ),
+
+      // 🔹 Step 3: FAB
+      floatingActionButton: widget.isLoggedIn
+          ? FloatingActionButton(
+              onPressed: navigateToAddClinic,
+              child: Icon(Icons.add),
+              backgroundColor: Colors.blue,
+            )
+          : null,
+
       body: Column(
         children: [
           Padding(
@@ -224,26 +370,29 @@ for (var clinic in loadedClinics) {
               ],
             ),
           ),
+          if (currentAddress != null)
+  Padding(
+    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(Icons.my_location, color: Colors.blue, size: 20),
+        SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            "You are here: $currentAddress",
+            style: TextStyle(fontSize: 14, color: Colors.black87),
+          ),
+        ),
+      ],
+    ),
+  ),
+
           Expanded(
             child: ListView.builder(
               itemCount: filteredList.length,
               itemBuilder: (context, index) {
-                final clinic = filteredList[index];
-                return Card(
-                  margin: EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-                  child: ListTile(
-                    title: Text(clinic['name']),
-                    subtitle: Text(
-                      "Qualification: ${clinic['qualification']}\n"
-                      "Phone: ${clinic['phone']}\n"
-                      "Address: ${clinic['address']}\n"
-                      "Area: ${clinic['area']}\n"   
-                      "Timing: ${clinic['timing']}",
-                      ),
-
-                    isThreeLine: true,
-                  ),
-                );
+                return buildClinicCard(filteredList[index]);
               },
             ),
           ),
@@ -253,7 +402,8 @@ for (var clinic in loadedClinics) {
   }
 }
 
-// --- LoginPage and SignupPage remain same (no change) ---
+// 🔹 LoginPage, SignupPage, and AddClinicPage remain unchanged (as in your code above)
+
 
 class LoginPage extends StatelessWidget {
   final VoidCallback onLoginSuccess;
@@ -411,49 +561,52 @@ class _AddClinicPageState extends State<AddClinicPage> {
   final experienceController = TextEditingController();
   final qualificationController = TextEditingController();
   final timingController = TextEditingController();
+  final addressController = TextEditingController();
+  List<Map<String, dynamic>> _addressSuggestions = [];
 
-  String address = "";
-  final flatNoController = TextEditingController();
-  final sectorController = TextEditingController();
-  final landmarkController = TextEditingController();
-  final areaController = TextEditingController();
-  final townCityController = TextEditingController();
-  final stateController = TextEditingController();
+  // 🔹 Store geocoded lat/lng
+  double? _latitude;
+  double? _longitude;
 
   void submitForm() async {
     if (_formKey.currentState!.validate()) {
-      if (address.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Please add an Address")),
-        );
-        return;
-      }
-
-     final newClinic = {
-  'name': nameController.text,
-  'email': emailController.text,
-  'phone': phoneController.text,
-  'address': address,
-  'area': areaController.text,             // 👈 Added
-  'townCity': townCityController.text,     
-  'state': stateController.text,           
-  'medicalId': medicalIdController.text,
-  'council': councilController.text,
-  'experience': experienceController.text,
-  'qualification': qualificationController.text,
-  'timing': timingController.text,
-  'createdAt': Timestamp.now(),
-};
-
-
       try {
+        // If lat/lng not already set, geocode now
+        final coords = _latitude != null && _longitude != null
+            ? {"lat": _latitude, "lng": _longitude}
+            : await getLatLngFromAddress(addressController.text);
+
+        if (coords == null) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Could not find location for this address")),
+          );
+          return;
+        }
+
+        final newClinic = {
+          'name': nameController.text,
+          'email': emailController.text,
+          'phone': phoneController.text,
+          'address': addressController.text,
+          'medicalId': medicalIdController.text,
+          'council': councilController.text,
+          'experience': experienceController.text,
+          'qualification': qualificationController.text,
+          'timing': timingController.text,
+          'createdAt': Timestamp.now(),
+          'lat': coords['lat'],
+          'lng': coords['lng'],
+        };
+
         await FirebaseFirestore.instance.collection('clinics').add(newClinic);
+
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text("Clinic added!")));
-        Navigator.pop(context, true);
+        Navigator.pop(context, true); // Return true to refresh clinic list
       } catch (e) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text("Failed to add clinic")));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Failed to add clinic: $e")),
+        );
       }
     }
   }
@@ -468,53 +621,6 @@ class _AddClinicPageState extends State<AddClinicPage> {
         validator: (value) =>
             value == null || value.isEmpty ? 'Enter $label' : null,
       ),
-    );
-  }
-
-  void openAddressDialog() {
-    showDialog(
-      context: context,
-      builder: (ctx) {
-        return AlertDialog(
-          title: Text("Add Address"),
-          content: SingleChildScrollView(
-            child: Column(
-              children: [
-                buildTextField("Flat No / House No", flatNoController),
-                buildTextField("Sector / Street / Village", sectorController),
-                buildTextField("Landmark", landmarkController),
-                buildTextField("Area", areaController),
-                buildTextField("Town/City", townCityController),
-                buildTextField("State", stateController),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                if (flatNoController.text.isEmpty ||
-                    sectorController.text.isEmpty ||
-                    landmarkController.text.isEmpty ||
-                    areaController.text.isEmpty ||
-                    townCityController.text.isEmpty ||
-                    stateController.text.isEmpty) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text("All address fields are required")),
-                  );
-                  return;
-                }
-
-                setState(() {
-                  address =
-                      "${flatNoController.text}, ${sectorController.text}, ${landmarkController.text}, ${areaController.text}, ${townCityController.text}, ${stateController.text}";
-                });
-                Navigator.pop(ctx);
-              },
-              child: Text("Save"),
-            )
-          ],
-        );
-      },
     );
   }
 
@@ -539,25 +645,88 @@ class _AddClinicPageState extends State<AddClinicPage> {
               buildTextField("Experience", experienceController),
               buildTextField("Qualification", qualificationController),
               buildTextField("Timing", timingController),
+
               SizedBox(height: 12),
+              TextFormField(
+                controller: addressController,
+                decoration: InputDecoration(
+                  labelText: "Address",
+                  border: OutlineInputBorder(),
+                ),
+                onChanged: (value) async {
+                  final results = await searchAddress(value);
+                  setState(() {
+                    _addressSuggestions = results;
+                  });
+                },
+                validator: (value) =>
+                    value == null || value.isEmpty ? 'Enter Address' : null,
+              ),
+
+              // 🔹 Suggestions list
+              ..._addressSuggestions.map((s) => ListTile(
+                    title: Text(s["display_name"]),
+                    onTap: () {
+                      setState(() {
+                        addressController.text = s["display_name"];
+                        _addressSuggestions = [];
+                      });
+                    },
+                  )),
+
+              SizedBox(height: 10),
+
+              // 🔹 Get Location button
+              ElevatedButton(
+                onPressed: () async {
+                  if (addressController.text.isNotEmpty) {
+                    try {
+                      final coords =
+                          await getLatLngFromAddress(addressController.text);
+                      setState(() {
+                        _latitude = coords?['lat'];
+                        _longitude = coords?['lng'];
+                      });
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                            content: Text(
+                                "Location Found: ($_latitude, $_longitude)")),
+                      );
+                    } catch (e) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text("Could not find location")),
+                      );
+                    }
+                  }
+                },
+                child: Text("Get Location"),
+              ),
+
+              SizedBox(height: 20),
               ElevatedButton(
                 onPressed: submitForm,
                 child: Text("Submit"),
               ),
-              SizedBox(height: 10),
-              ElevatedButton(
-                onPressed: openAddressDialog,
-                child: Text("Add Address"),
-              ),
-              if (address.isNotEmpty) ...[
-                SizedBox(height: 10),
-                Text("Address Added:\n$address",
-                    style: TextStyle(fontWeight: FontWeight.bold)),
-              ]
             ],
           ),
         ),
       ),
     );
+  }
+}
+
+Future<String> getAddressFromLatLng(double lat, double lng) async {
+  final url = Uri.parse(
+      "https://nominatim.openstreetmap.org/reverse?format=json&lat=$lat&lon=$lng");
+
+  final response = await http.get(url, headers: {
+    "User-Agent": "DoctorApp/1.0 (your_email@example.com)"
+  });
+
+  if (response.statusCode == 200) {
+    final data = jsonDecode(response.body);
+    return data["display_name"] ?? "Unknown location";
+  } else {
+    throw Exception("Failed to fetch address");
   }
 }
