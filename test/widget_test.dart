@@ -6,15 +6,15 @@
 // tree, read text, and verify that the values of widget properties are correct.
 
 
+import 'package:demo/Locality_manual_filter.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:demo/main.dart';
 
 void main() {
   testWidgets('Counter increments smoke test', (WidgetTester tester) async {
     // Build our app and trigger a frame.
-    await tester.pumpWidget(DoctorClinicApp as Widget);
+    await tester.pumpWidget(FilterBar() as Widget);
 
     // Verify that our counter starts at 0.
     expect(find.text('0'), findsOneWidget);
